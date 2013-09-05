@@ -13,10 +13,6 @@
 //########################################################################################################################
 // Default Configuration
 //########################################################################################################################
-//#define myNodeID 30      // RF12 node ID in the range 1-30
-// 17 for LDC
-#define AS_PHOTOCELL 1
-//#define AS_TWO_TEMP_PROBES 1
 #define STATIC_ONEWIRE_INDEXES 1 // Save time and 118 Bytes of code : good for ATTiny !
 
 //########################################################################################################################
@@ -51,36 +47,58 @@ struct StoreStruct {
 #define ACK_TIME 100       // Number of milliseconds to wait for an ack
 
 #include <OneWire.h>   // http://www.pjrc.com/teensy/arduino_libraries/OneWire.zip
-#include <DallasTemperature.h>  // http://download.milesburton.com/Arduino/MaximTemperature/DallasTemperature_371Beta.zip
-//#define TEMPERATURE_PRECISION 9
+#include <DallasTemperature.h>
+#include <ds2408.h>  //https://bitbucket.org/lutorm/arduino/src/7231276bd618/libraries/ds2408?at=default
+
 #define ASYNC_DELAY 750 // 9bit requres 95ms, 10bit 187ms, 11bit 375ms and 12bit resolution takes 750ms
  
 #define ONE_WIRE_BUS PIN_A7    // pad 5 of the Funky
 #define tempPower PIN_A3       // Power pin is connected pad 4 on the Funky
 #define LEDpin PIN_A0
 
-#ifdef AS_PHOTOCELL
-#define PHOTOCELLpin PIN_A1 // the LDR will be connected to analog 1
-#else
 #define ADCFORVCCONLY 1
-#endif
+
+#define LEVEL_CLOSED 0
+#define LEVEL_FULL_OPEN 255
+
+#define COMMAND_UNKNOWN 0
+#define COMMAND_OPEN 1
+#define COMMAND_CLOSE 2
+#define COMMAND_STOP 3
+
+// 250ms loop duration, 30s max action list : 120 iterations
+#define CURTAIN_LOOP_MAX_ITERATIONS 128
+#define CURTAIN_LOOP_DURATION 250
+
+#define CURTAIN_ACTION_LIST_LEN 32
 
 //########################################################################################################################
 // Local typefdefs
 //########################################################################################################################
 typedef struct {
-   byte nodeid;  // Node ID
-   byte id;      // Packet ID
-   int temp1;	   // Temperature reading  Probe 1
-   unsigned int supplyV;	// Supply voltage
-#ifdef AS_TWO_TEMP_PROBES
-   int temp2;	   // Temperature reading  Probe 2
-#endif
-   byte numsensors;
-#ifdef AS_PHOTOCELL
-   byte photocell;
-#endif
+  byte nodeid;          // Node ID
+  byte id;              // Packet ID
+  byte status;          // 
+  byte nbCommands;	
+  byte lastCommand;
+  unsigned int supplyV; // Supply voltage
+  byte numsensors;
 } Payload_t;
+
+typedef struct {
+  byte group;
+  byte timeToOpen;
+  byte timeToClose;
+  byte currentLevel;
+  byte lastCommand;
+} curtain_t;
+
+typedef struct {
+  byte command;
+  byte action_tic;
+  byte curtain_index;
+  byte curtain_next_level;
+} curtain_action_t;
 
 //########################################################################################################################
 // Local functions
@@ -90,26 +108,24 @@ static unsigned int vccRead(unsigned int count);
 #else
 static unsigned int adcMeanRead(byte adcmux, unsigned int count, bool tovdc);
 #endif
-static void readDS18120(void);
-static void blinkLED(byte ntimes, byte time);
 void RF_AirSend(Payload_t *pl);
 
 // Special for configuration
+void listenConfig(void);
 void loadConfig();
 void saveConfig();
+
+// Utilities
+static void blinkLED(byte ntimes, byte time);
+static byte waitForAck();
+static void loseSomeTime(unsigned int ms);
 
 //########################################################################################################################
 // Local variables
 //########################################################################################################################
-// Setup a oneWire instance to communicate with any OneWire devices 
-// (not just Maxim/Dallas temperature ICs)
-OneWire oneWire(ONE_WIRE_BUS);
-// Pass our oneWire reference to Dallas Temperature.
-DallasTemperature sensors(&oneWire);
-#ifdef STATIC_ONEWIRE_INDEXES
-// addresses of sensors, MAX 4!!  
-byte allAddress [3][8];  // 8 bytes per address
-#endif
+// Setup a DS2408 (OneWire BUS created on the fly)
+DS2408 iocontrol(ONE_WIRE_BUS);
+Devices devices;
 
 volatile bool adcDone;
 
@@ -121,9 +137,21 @@ ISR(WDT_vect) { Sleepy::watchdogEvent(); }
 
 Payload_t staticpayload;
 
+curtain_t curtains[] = {  {1, 15, 20, LEVEL_CLOSED, COMMAND_UNKNOWN},
+                          {2, 15, 20, LEVEL_CLOSED, COMMAND_UNKNOWN},
+                          {3, 15, 20, LEVEL_CLOSED, COMMAND_UNKNOWN},
+                          {4, 15, 20, LEVEL_CLOSED, COMMAND_UNKNOWN},
+                          {5, 15, 20, LEVEL_CLOSED, COMMAND_UNKNOWN},
+                          {0}};
+
+curtain_action_t curtain_actions[CURTAIN_ACTION_LIST_LEN];
+
 //########################################################################################################################
 // LOCAL Functions
 //########################################################################################################################
+//--------------------------------------------------------------------------------------------------
+// Send payload data via RF
+//--------------------------------------------------------------------------------------------------
 #ifdef ADCFORVCCONLY
 static unsigned int vccRead(unsigned int count = 10) {
 #else
@@ -172,41 +200,6 @@ static unsigned int adcMeanRead(byte adcmux, unsigned int count = 10, bool tovdc
 #endif
 }
 
-static void readDS18120(void)
-{
-  pinMode(tempPower, OUTPUT);     // set power pin for DS18B20 to output  
-  digitalWrite(tempPower, HIGH);  // turn DS18B20 sensor on
-  loseSomeTime(20);               // Allow 10ms for the sensor to be ready
-  sensors.requestTemperatures();  // Send the command to get temperatures
-  loseSomeTime(ASYNC_DELAY);           // Must wait for conversion, since we use ASYNC mode
-  
-#ifdef STATIC_ONEWIRE_INDEXES 
-  staticpayload.temp1 = sensors.getTempC(allAddress[0])*100;   // Read Probe 1
-#ifdef AS_TWO_TEMP_PROBES
-  if(staticpayload.numsensors > 1)
-    staticpayload.temp2 = sensors.getTempC(allAddress[1])*100; // Read Probe 2
-#endif
-#else  
-  staticpayload.temp1 = sensors.getTempCByIndex(0)*100;   // Read Probe 1
-#ifdef AS_TWO_TEMP_PROBES
-  if(staticpayload.numsensors > 1)
-    staticpayload.temp2 = sensors.getTempCByIndex(1)*100; // Read Probe 2
-#endif
-#endif
-
-  digitalWrite(tempPower, LOW); // turn DS18B20 sensor off
-  pinMode(tempPower, INPUT);
-}
-
-static void blinkLED(byte ntimes, byte time){
-  for (byte i = 0; i <= ntimes; ++i) {
-      digitalWrite(LEDpin,LOW);
-      loseSomeTime(time/2);
-      digitalWrite(LEDpin,HIGH);
-      loseSomeTime(time/2);
-  }
-}
-
 //--------------------------------------------------------------------------------------------------
 // Send payload data via RF
 //--------------------------------------------------------------------------------------------------
@@ -216,28 +209,20 @@ void RF_AirSend(Payload_t *pl){
    
   for (byte i = 0; i <= RETRY_LIMIT; ++i) {  // tx and wait for ack up to RETRY_LIMIT times
        rf12_sleep(RF12_WAKEUP);
-       //int i = 1; 
-       //while (!rf12_canSend() && i<10) {rf12_recvDone(); i++;}            
+            
        byte header = RF12_HDR_ACK | RF12_HDR_DST | destNodeID;
   
        rf12_sendNow(header, pl, sizeof *pl);
        rf12_sendWait(2); // Wait for RF to finish sending while in standby mode
 #if NEED_ACK
-//       if(needACK){
          byte acked = waitForAck();  // Wait for ACK
-//       }
 #endif
        rf12_sleep(RF12_SLEEP);
 #if NEED_ACK
-//       if(needACK){
          if (acked) { break; }      // Return if ACK received
          loseSomeTime(RETRY_PERIOD * 500);     // If no ack received wait and try again
-//       }
-//       else
-//       {
 #else
           break;
-//       }
 #endif
   } 
    
@@ -248,6 +233,9 @@ void RF_AirSend(Payload_t *pl){
 //########################################################################################################################
 // GLOBAL Functions
 //########################################################################################################################
+//--------------------------------------------------------------------------------------------------
+// Arduino STYLE / SETUP
+//--------------------------------------------------------------------------------------------------
 void setup() {
    pinMode(LEDpin, OUTPUT);
    blinkLED(1, 50);
@@ -265,6 +253,7 @@ void setup() {
    rf12_initialize(storage.myNodeID, freq, configurationNetwork);
    listenConfig();
    
+   // Load configuration, previous one or just saved one
    loadConfig();
   
    rf12_initialize(storage.myNodeID, freq, productionNetwork); // Initialize RFM12 with settings defined above 
@@ -283,72 +272,70 @@ void setup() {
    digitalWrite(tempPower, HIGH); // turn sensor power on
    loseSomeTime(50); // Allow 50ms for the sensor to be ready
    // Start up the library
-   sensors.begin();
-   sensors.setWaitForConversion(false); 
-   staticpayload.numsensors = sensors.getDeviceCount();
+   //sensors.begin();
+   //sensors.setWaitForConversion(false); 
+   //staticpayload.numsensors = sensors.getDeviceCount();
 
-#ifdef STATIC_ONEWIRE_INDEXES
-    byte j=0;   // search for one wire devices and
-    while ((j < staticpayload.numsensors) && (oneWire.search(allAddress[j]))) {        
-      j++;
-    }
-#endif
-   
-#ifdef AS_PHOTOCELL
-   digitalWrite(PHOTOCELLpin, LOW); // Turns pull up off
-   pinMode(PHOTOCELLpin, INPUT);
-#endif
+  staticpayload.numsensors = iocontrol.find(&devices);
+  for(int index=0; index < staticpayload.numsensors; index++) {
+    iocontrol.set_mode(devices[index], RESET_PIN_MODE(STROBE_MODE));
+  }
+  
+  // Initialize action list at 0
+  memset(curtain_actions, 0, sizeof curtain_actions);
 
-   blinkLED(1, 50);
+  blinkLED(1, 50);
 }
 
+
+void curtain_loop(){
+  for (byte tic = 0; tic < CURTAIN_LOOP_MAX_ITERATIONS; ++tic){
+    // Parse action list
+    for (byte action_index = 0; action_index < CURTAIN_ACTION_LIST_LEN; ++action_index){
+      curtain_action_t *action = &(curtain_actions[action_index]);
+      if( (action->command != COMMAND_UNKNOWN) &&
+          (action->action_tic < tic)){
+        // Action
+        // set_curtain(action->curtain_index, action->curtain_next_level);
+        // Status
+        curtains[action->curtain_index].currentLevel = action->curtain_next_level;
+        curtains[action->curtain_index].lastCommand = action->command;
+        // Mark as done
+        action->command = COMMAND_UNKNOWN;
+      }
+    }
+    loseSomeTime(CURTAIN_LOOP_DURATION);
+  }
+}
+
+
+//--------------------------------------------------------------------------------------------------
+// Arduino STYLE / LOOP
+//--------------------------------------------------------------------------------------------------
 void loop() {
    bitClear(PRR, PRADC); // power up the ADC
    loseSomeTime(16); // Allow 10ms for the sensor to be ready
   
    staticpayload.supplyV = vccRead(4);
    // staticpayload temp1 & temp2 set according configuration
-   readDS18120();
+   //readDS18120();
+  uint8_t state = 0;
+  iocontrol.set_state(state, true);
 
-#ifdef AS_PHOTOCELL
-   // Need to enable the pull-up to get a voltage drop over the LDR
-   pinMode(PHOTOCELLpin, INPUT_PULLUP);
-   staticpayload.photocell = (adcMeanRead(B10000001, 4, false) & 0x1FF) / 2;
-   digitalWrite(PHOTOCELLpin, LOW); // Turns pull up off
-   pinMode(PHOTOCELLpin, INPUT);
-#endif
    bitSet(PRR, PRADC); // power down the ADC
 
    staticpayload.nodeid = storage.myNodeID;
    staticpayload.id += 1;
     
-   RF_AirSend(&staticpayload);
+  RF_AirSend(&staticpayload);
   
-   // Controlled by Configuration !
-   for (byte i = 0; i < storage.loopIterations; ++i)
-     loseSomeTime(storage.loopDuration*1000);
+  curtain_loop();
+
+  // Controlled by Configuration !
+  for (byte i = 0; i < storage.loopIterations; ++i)
+    loseSomeTime(storage.loopDuration*1000);
 }
 
-static byte waitForAck() {
-  MilliTimer ackTimer;
-  while (!ackTimer.poll(ACK_TIME)) {
-   if (rf12_recvDone() && rf12_crc == 0 && rf12_hdr == (RF12_HDR_CTL | destNodeID))
-     return 1;
-  }
-   return 0;
-}
-
-void loseSomeTime(unsigned int ms){
-    byte oldADCSRA=ADCSRA;      // Save ADC state
-    byte oldADCSRB=ADCSRB;
-    byte oldADMUX=ADMUX;
-    
-    Sleepy::loseSomeTime(ms);   // JeeLabs power save function: enter low power mode for x seconds (valid range 16-65000 ms)
-    
-    ADCSRA=oldADCSRA;           // Restore ADC state
-    ADCSRB=oldADCSRB;
-    ADMUX=oldADMUX;    
-}
 
 //########################################################################################################################
 // Configuration functions
@@ -408,4 +395,44 @@ void listenConfig(void){
    
   blinkLED(2, 25);
   bitSet(PRR, PRUSI); // disable USI h/w
+}
+
+//########################################################################################################################
+// Utilities
+//########################################################################################################################
+//--------------------------------------------------------------------------------------------------
+// waitForAck
+//--------------------------------------------------------------------------------------------------
+static byte waitForAck() {
+  MilliTimer ackTimer;
+  while (!ackTimer.poll(ACK_TIME)) {
+   if (rf12_recvDone() && rf12_crc == 0 && rf12_hdr == (RF12_HDR_CTL | destNodeID))
+     return 1;
+  }
+   return 0;
+}
+//--------------------------------------------------------------------------------------------------
+// loseSomeTime
+//--------------------------------------------------------------------------------------------------
+static void loseSomeTime(unsigned int ms){
+    byte oldADCSRA=ADCSRA;      // Save ADC state
+    byte oldADCSRB=ADCSRB;
+    byte oldADMUX=ADMUX;
+    
+    Sleepy::loseSomeTime(ms);   // JeeLabs power save function: enter low power mode for x seconds (valid range 16-65000 ms)
+    
+    ADCSRA=oldADCSRA;           // Restore ADC state
+    ADCSRB=oldADCSRB;
+    ADMUX=oldADMUX;    
+}
+//--------------------------------------------------------------------------------------------------
+// blinkLED
+//--------------------------------------------------------------------------------------------------
+static void blinkLED(byte ntimes, byte time){
+  for (byte i = 0; i <= ntimes; ++i) {
+      digitalWrite(LEDpin,LOW);
+      loseSomeTime(time/2);
+      digitalWrite(LEDpin,HIGH);
+      loseSomeTime(time/2);
+  }
 }
